@@ -11,6 +11,12 @@ XRAY_INSTALL_SCRIPT="https://github.com/XTLS/Xray-install/raw/main/install-relea
 METADATA_DIR="$XRAY_CONFIG_DIR/inbounds"
 SCRIPT_PATH="/usr/local/bin/xray-tool"
 
+# Client-side DPI countermeasures appended to generated VLESS links.
+# Happ / Xray-based clients understand these; other clients ignore unknown params.
+# Format: fragment=<length>,<interval>,<packets>[,maxSplit]
+# Set to "" to disable if it causes problems on your network.
+DPI_FRAGMENT="1-10,5-20,tlshello"
+
 # ----------------------------------------------
 # Helper functions
 # ----------------------------------------------
@@ -52,8 +58,21 @@ cmd_install() {
         echo "Enabling BBR..."
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p
     fi
+
+    # Network stability tweaks: keep long-lived mobile tunnels alive through NAT/DPI
+    for kv in \
+        "net.ipv4.tcp_slow_start_after_idle=0" \
+        "net.ipv4.tcp_mtu_probing=1" \
+        "net.ipv4.tcp_keepalive_time=60" \
+        "net.ipv4.tcp_keepalive_intvl=20" \
+        "net.ipv4.tcp_keepalive_probes=5"; do
+        key="${kv%%=*}"
+        if ! grep -q "^${key}=" /etc/sysctl.conf 2>/dev/null; then
+            echo "$kv" >> /etc/sysctl.conf
+        fi
+    done
+    sysctl -p >/dev/null 2>&1 || true
 
     bash -c "$(curl -4 -L $XRAY_INSTALL_SCRIPT)" @ install
 
@@ -66,7 +85,7 @@ cmd_install() {
         { "protocol": "freedom", "tag": "direct" },
         { "protocol": "blackhole", "tag": "block" }
     ],
-    "policy": { "levels": { "0": { "handshake": 3, "connIdle": 180 } } }
+    "policy": { "levels": { "0": { "handshake": 10, "connIdle": 600 } } }
 }
 EOF
 
@@ -135,8 +154,8 @@ cmd_inbounds_add() {
         *) echo "Invalid choice"; return 1;;
     esac
 
-    read -p "Target domain (default: dl.google.com:443): " target
-    target=${target:-dl.google.com:443}
+    read -p "Target domain (default: www.apple.com:443): " target
+    target=${target:-www.apple.com:443}
     sni=$(echo "$target" | cut -d: -f1)
 
     echo "Select client fingerprint (TLS imitation):"
@@ -158,11 +177,22 @@ cmd_inbounds_add() {
 
     grpc_service=""
     xhttp_path=""
+    xhttp_mode="auto"
     if [ "$transport" = "grpc" ]; then
         read -p "gRPC serviceName (default: empty, press Enter): " grpc_service
     elif [ "$transport" = "xhttp" ]; then
         read -p "XHTTP path (default: /): " xhttp_path
         xhttp_path=${xhttp_path:-/}
+        echo "XHTTP mode (affects only the client link; server accepts all modes):"
+        echo "1) auto       (default; with REALITY the client uses stream-one)"
+        echo "2) packet-up  (best compatibility, survives DPI/NAT drops best)"
+        echo "3) stream-up  (gRPC-masqueraded streaming)"
+        read -p "Choice [1-3] (default: 1): " xhttp_mode_choice
+        case $xhttp_mode_choice in
+            2) xhttp_mode="packet-up";;
+            3) xhttp_mode="stream-up";;
+            *) xhttp_mode="auto";;
+        esac
     fi
 
     # --- FIXED KEY PARSING ---
@@ -199,6 +229,11 @@ cmd_inbounds_add() {
                 "serverNames": [$sni],
                 "privateKey": $privKey,
                 "shortIds": [$shortid]
+            },
+            "sockopt": {
+                "tcpKeepAliveIdle": 45,
+                "tcpKeepAliveInterval": 15,
+                "tcpUserTimeout": 10000
             }
         }')
 
@@ -242,6 +277,7 @@ publicKey=$publicKey
 shortId=$shortid
 grpcServiceName=$grpc_service
 xhttpPath=$xhttp_path
+xhttpMode=$xhttp_mode
 flow=$flow
 fingerprint=$fingerprint
 EOF
@@ -410,6 +446,8 @@ cmd_clients_qr() {
         return 1
     fi
     source "$info_file"
+    xhttpMode=${xhttpMode:-auto}
+    xhttpPath=${xhttpPath:-/}
 
     client_flow=$(jq --argjson port "$port" --arg email "$email" -r \
         '.inbounds[] | select(.port == $port) | .settings.clients[] | select(.email == $email) | .flow' "$XRAY_CONFIG_FILE")
@@ -421,15 +459,20 @@ cmd_clients_qr() {
         read -p "Server IP: " server_ip
     fi
 
+    dpi_params=""
+    if [ -n "$DPI_FRAGMENT" ]; then
+        dpi_params="&fragment=${DPI_FRAGMENT}"
+    fi
+
     case $type in
         tcp)
-            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=tcp&flow=${client_flow}&encryption=none#${email}"
+            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=tcp&flow=${client_flow}&encryption=none${dpi_params}#${email}"
             ;;
         grpc)
-            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=grpc&serviceName=${grpcServiceName}&encryption=none#${email}"
+            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=grpc&serviceName=${grpcServiceName}&alpn=h2&encryption=none${dpi_params}#${email}"
             ;;
         xhttp)
-            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=xhttp&path=${xhttpPath}&encryption=none#${email}"
+            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=xhttp&path=${xhttpPath}&mode=${xhttpMode}&alpn=h2&encryption=none${dpi_params}#${email}"
             ;;
         *)
             echo "Unknown transport type: $type"
